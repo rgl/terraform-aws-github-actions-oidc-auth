@@ -1,0 +1,186 @@
+name: Build
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  build-with-aws-cli:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Show Environment Variables
+        run: |
+          set -euo pipefail
+          env | sort
+      - name: Use AWS
+        run: |
+          set -euo pipefail
+          exec 2>&1
+          set -x
+          aws sts get-caller-identity # get caller identity details.
+          aws ec2 describe-vpcs       # get vpcs.
+  build-with-curl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xq
+        run: |
+          set -euo pipefail
+          # see https://github.com/sibprogrammer/xq/releases
+          # renovate: datasource=github-releases depName=sibprogrammer/xq
+          XQ_VERSION='1.3.0'
+          url="https://github.com/sibprogrammer/xq/releases/download/v${XQ_VERSION}/xq_${XQ_VERSION}_linux_amd64.tar.gz"
+          t="$(mktemp -q -d --suffix=.xq)"
+          wget -qO- "$url" | tar xzf - -C "$t" xq
+          install -m 755 "$t/xq" /usr/local/bin/xq
+          rm -rf "$t"
+      - name: Get GitHub Actions OIDC ID Token
+        id: get_github_id_token
+        run: |
+          set -euo pipefail
+          # see https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#updating-your-actions-for-oidc
+          GITHUB_ID_TOKEN=$(
+            curl \
+              --silent \
+              --show-error \
+              --fail-with-body \
+              --request GET \
+              --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+              | jq -r .value)
+          if [ -z "$GITHUB_ID_TOKEN" ]; then
+            exit 1
+          fi
+          echo "::add-mask::$GITHUB_ID_TOKEN"
+          echo "github_id_token=$GITHUB_ID_TOKEN" >> $GITHUB_OUTPUT
+      - name: Exchange GitHub OIDC Token for AWS Credentials
+        id: get_aws_credentials
+        env:
+          GITHUB_ID_TOKEN: ${{ steps.get_github_id_token.outputs.github_id_token }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$AWS_ROLE_ARN" ] || [ -z "$AWS_REGION" ]; then
+            echo "ERROR: You must set the AWS_ROLE_ARN and AWS_REGION environment variables."
+            exit 1
+          fi
+
+          # see https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
+          CREDENTIALS=$(
+            curl \
+              --silent \
+              --show-error \
+              --fail-with-body \
+              --request POST \
+              --header "Content-Type: application/x-www-form-urlencoded" \
+              --header "Accept: application/json" \
+              --data-urlencode "Action=AssumeRoleWithWebIdentity" \
+              --data-urlencode "Version=2011-06-15" \
+              --data-urlencode "RoleArn=$AWS_ROLE_ARN" \
+              --data-urlencode "RoleSessionName=GitHubActions" \
+              --data-urlencode "WebIdentityToken=$GITHUB_ID_TOKEN" \
+              "https://sts.$AWS_REGION.amazonaws.com" \
+              | jq .AssumeRoleWithWebIdentityResponse.AssumeRoleWithWebIdentityResult.Credentials)
+
+          AWS_ACCESS_KEY_ID=$(echo "$CREDENTIALS" | jq -r .AccessKeyId)
+          AWS_SECRET_ACCESS_KEY=$(echo "$CREDENTIALS" | jq -r .SecretAccessKey)
+          AWS_SESSION_TOKEN=$(echo "$CREDENTIALS" | jq -r .SessionToken)
+
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$AWS_SESSION_TOKEN" ]; then
+            exit 1
+          fi
+
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "::add-mask::$AWS_SESSION_TOKEN"
+
+          echo "aws_access_key_id=$AWS_ACCESS_KEY_ID" >> $GITHUB_OUTPUT
+          echo "aws_secret_access_key=$AWS_SECRET_ACCESS_KEY" >> $GITHUB_OUTPUT
+          echo "aws_session_token=$AWS_SESSION_TOKEN" >> $GITHUB_OUTPUT
+      - name: Use AWS (curl)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.get_aws_credentials.outputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.get_aws_credentials.outputs.aws_secret_access_key }}
+          AWS_SESSION_TOKEN: ${{ steps.get_aws_credentials.outputs.aws_session_token }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          # get caller identity details.
+          # NB this is the equivalent of aws sts get-caller-identity.
+          # see https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+          echo "Caller Identity:"
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+            --header "x-amz-security-token: $AWS_SESSION_TOKEN" \
+            --aws-sigv4 "aws:amz:$AWS_REGION:sts" \
+            --request POST \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --header "Accept: application/json" \
+            --data-urlencode "Action=GetCallerIdentity" \
+            --data-urlencode "Version=2011-06-15" \
+            "https://sts.$AWS_REGION.amazonaws.com" \
+            | jq
+
+          # get vpcs.
+          # NB this is the equivalent of aws ec2 describe-vpcs.
+          # NB the ec2 api does not support json. only xml. so we use xq
+          #    instead of jq.
+          # see https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeVpcs.html
+          echo "VPCs:"
+          curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+            --header "x-amz-security-token: $AWS_SESSION_TOKEN" \
+            --aws-sigv4 "aws:amz:$AWS_REGION:ec2" \
+            --request POST \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "Action=DescribeVpcs" \
+            --data-urlencode "Version=2016-11-15" \
+            "https://ec2.$AWS_REGION.amazonaws.com" \
+            | xq
+      - name: Use AWS (boto3)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.get_aws_credentials.outputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.get_aws_credentials.outputs.aws_secret_access_key }}
+          AWS_SESSION_TOKEN: ${{ steps.get_aws_credentials.outputs.aws_session_token }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          python3 <<EOF
+          import boto3, os, json
+
+          session = boto3.Session(
+            aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+            aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+            aws_session_token=os.environ['AWS_SESSION_TOKEN'],
+            region_name=os.environ['AWS_REGION']
+          )
+
+          # get caller identity details.
+          # NB this is the equivalent of aws sts get-caller-identity.
+          # see https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+          print('Caller Identity:')
+          print(json.dumps(session.client('sts').get_caller_identity(), indent=2))
+
+          # get vpcs.
+          # NB this is the equivalent of aws ec2 describe-vpcs.
+          # see https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeVpcs.html
+          print('VPCs:')
+          print(json.dumps(session.client('ec2').describe_vpcs(), indent=2))
+          EOF

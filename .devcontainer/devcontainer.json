@@ -1,0 +1,21 @@
+{
+  "name": "Terraform",
+  "dockerFile": "Dockerfile",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "github.vscode-github-actions",
+        "hashicorp.terraform",
+        "ms-python.black-formatter",
+        "ms-python.python-pylance",
+        "ms-python.python",
+        "streetsidesoftware.code-spell-checker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "python.languageServer": "Pylance"
+      }
+    }
+  }
+}
